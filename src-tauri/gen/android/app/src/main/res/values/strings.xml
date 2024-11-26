@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">volume-sync</string>
+    <string name="main_activity_title">volume-sync</string>
+</resources>
