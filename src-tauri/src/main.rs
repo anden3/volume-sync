@@ -1,14 +1,19 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use windows::Win32::{
-    Foundation::{RPC_E_CHANGED_MODE, S_FALSE},
-    Media::Audio::{
-        eConsole, eRender, Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator, MMDeviceEnumerator,
-    },
-    System::Com::{
-        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_DISABLE_OLE1DDE,
-        COINIT_MULTITHREADED,
+use windows::{
+    core::*,
+    Win32::{
+        Foundation::{RPC_E_CHANGED_MODE, S_FALSE},
+        Media::Audio::{
+            eConsole, eRender,
+            Endpoints::{
+                IAudioEndpointVolume, IAudioEndpointVolumeCallback,
+                IAudioEndpointVolumeCallback_Impl,
+            },
+            IMMDeviceEnumerator, MMDeviceEnumerator, AUDIO_VOLUME_NOTIFICATION_DATA,
+        },
+        System::Com::*,
     },
 };
 
@@ -36,40 +41,64 @@ fn initialize_com() -> CoInitializeGuard {
     }
 }
 
-unsafe fn get_default_audio_device() -> windows::Win32::Media::Audio::IMMDevice {
+unsafe fn get_default_audio_volume_interface() -> IAudioEndpointVolume {
     let imm_device_enumerator: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.unwrap();
 
-    unsafe { imm_device_enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }.unwrap()
+    let device =
+        unsafe { imm_device_enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }.unwrap();
+
+    unsafe { device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) }.unwrap()
 }
 
-unsafe fn get_master_volume() -> f32 {
-    let device = unsafe { get_default_audio_device() };
-    let endpoint_volume =
-        unsafe { device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) }.unwrap();
-
-    unsafe { endpoint_volume.GetMasterVolumeLevelScalar() }.unwrap()
+unsafe fn get_master_volume(volume_interface: &IAudioEndpointVolume) -> f32 {
+    unsafe { volume_interface.GetMasterVolumeLevelScalar() }.unwrap()
 }
 
-unsafe fn set_master_volume(volume: f32) {
+unsafe fn set_master_volume(volume_interface: &IAudioEndpointVolume, volume: f32) {
     let volume = volume.clamp(0.0, 0.3);
-    let device = unsafe { get_default_audio_device() };
-    let endpoint_volume =
-        unsafe { device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) }.unwrap();
-
-    unsafe { endpoint_volume.SetMasterVolumeLevelScalar(volume, &windows::core::GUID::zeroed()) }
+    unsafe { volume_interface.SetMasterVolumeLevelScalar(volume, &windows::core::GUID::zeroed()) }
         .unwrap();
+}
+
+unsafe fn register_volume_callback(
+    volume_interface: &IAudioEndpointVolume,
+) -> IAudioEndpointVolumeCallback {
+    let volume_callback: IAudioEndpointVolumeCallback = AudioEndpointVolumeCallback.into();
+
+    unsafe { volume_interface.RegisterControlChangeNotify(&volume_callback) }.unwrap();
+    volume_callback
+}
+
+#[implement(IAudioEndpointVolumeCallback)]
+struct AudioEndpointVolumeCallback;
+
+impl IAudioEndpointVolumeCallback_Impl for AudioEndpointVolumeCallback_Impl {
+    fn OnNotify(&self, pnotify: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> windows_core::Result<()> {
+        println!(
+            "volume changed: {:.0}",
+            unsafe { *pnotify }.fMasterVolume * 100.0
+        );
+        Ok(())
+    }
 }
 
 fn main() {
     let _guard = initialize_com();
 
-    let current_volume = unsafe { get_master_volume() };
+    let volume_interface = unsafe { get_default_audio_volume_interface() };
+    let volume_callback = unsafe { register_volume_callback(&volume_interface) };
+
+    let current_volume = unsafe { get_master_volume(&volume_interface) };
     println!("Volume before: {:.0}", current_volume * 100.0);
-    unsafe { set_master_volume(current_volume * 0.5) };
+    unsafe { set_master_volume(&volume_interface, current_volume * 0.5) };
     println!(
         "Volume after: {:.0}",
-        unsafe { get_master_volume() } * 100.0
+        unsafe { get_master_volume(&volume_interface) } * 100.0
     );
+
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    unsafe { volume_interface.UnregisterControlChangeNotify(&volume_callback) }.unwrap();
     // volume_sync_lib::run()
 }
