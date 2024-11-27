@@ -49,6 +49,16 @@ The focus is to implement this functionality for **your current operating system
    - Write tests for volume change logic or platform-specific integrations.
 
 
+## Prerequisites
+Before starting, ensure your environment meets the prerequisites for Tauri development.
+You can find the full list of required tools and setup instructions [here](https://tauri.app/start/prerequisites).
+
+To get the project started, you can run:
+```bash
+pnpm tauri dev          # For local development
+pnpm tauri android dev  # For Android development (if implemented)
+   ```
+
 ## Deliverables
 - A GitHub repository (or zip file) containing:
    - Rust project files.
