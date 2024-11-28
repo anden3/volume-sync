@@ -1,9 +1,9 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::{marker::PhantomData, rc::Rc, sync::Arc};
+use std::{marker::PhantomData, sync::mpsc};
 
-use arc_swap::ArcSwap;
+use tokio::sync::watch;
 use windows::{
     core::*,
     Win32::{
@@ -15,10 +15,14 @@ use windows::{
 
 pub type NotSendMarker = PhantomData<*const ()>;
 pub type VolumeCallbackFn<T> = fn(AUDIO_VOLUME_NOTIFICATION_DATA, &T) -> windows_core::Result<()>;
-pub type DefaultDeviceChangedCallbackFn<T> =
-    fn(EDataFlow, ERole, PCWSTR, &T) -> windows_core::Result<()>;
 
 const MAX_NORMALIZED_VOLUME_LEVEL: f32 = 0.3;
+
+enum AudioThreadCommand {
+    NewDefault(HSTRING),
+    DeviceRemoved(HSTRING),
+    SetVolume(f32),
+}
 
 struct CoInitializeGuard(NotSendMarker);
 
@@ -48,31 +52,71 @@ fn initialize_com() -> Option<CoInitializeGuard> {
     }
 }
 
-struct DefaultAudioOutput {
-    device: Rc<ArcSwap<Option<DefaultAudioOutputDevice>>>,
-    device_enumerator: Rc<IMMDeviceEnumerator>,
+fn get_device<ID: Param<PCWSTR>>(
+    device_enumerator: &IMMDeviceEnumerator,
+    id: ID,
+) -> Option<IMMDevice> {
+    // SAFETY: `device_enumerator` is a valid reference.
+    match unsafe { device_enumerator.GetDevice(id) } {
+        Ok(device) => Some(device),
+        Err(e) if e.code() == ERROR_NOT_FOUND.to_hresult() => {
+            eprintln!("no output devices found");
+            None
+        }
+        Err(e) => panic!("failed to retrieve default audio output device: {e}"),
+    }
+}
+
+fn get_default_device(device_enumerator: &IMMDeviceEnumerator) -> Option<IMMDevice> {
+    // `eRender` is output, `eConsole` is the default (and most common) role from what I can tell.
+    // SAFETY: `device_enumerator` is a valid reference.
+    match unsafe { device_enumerator.GetDefaultAudioEndpoint(eRender, eConsole) } {
+        Ok(device) => Some(device),
+        Err(e) if e.code() == ERROR_NOT_FOUND.to_hresult() => {
+            eprintln!("no output devices found");
+            None
+        }
+        Err(e) => panic!("failed to retrieve default audio output device: {e}"),
+    }
+}
+
+#[derive(Debug)]
+struct AudioMonitor {
+    volume_watch: watch::Receiver<Option<f32>>,
+    command_sender: mpsc::Sender<AudioThreadCommand>,
+    device_enumerator: IMMDeviceEnumerator,
     device_event_notif_client: IMMNotificationClient,
 }
 
-impl DefaultAudioOutput {
+impl AudioMonitor {
     pub fn new() -> Self {
-        // SAFETY: We don't pass a pointer in `punkouter`, so it can't be invalid.
-        let device_enumerator: Rc<IMMDeviceEnumerator> = Rc::new(
-            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
-                .expect("all parameters should be valid"),
-        );
+        let (command_tx, command_rx) = mpsc::channel::<AudioThreadCommand>();
+        let (watch_tx, watch_rx) = watch::channel(None);
 
-        // SAFETY: The callback doesn't do any blocking operations, nor does it wait on synchronization,
-        // and it doesn't call `IAudioEndpointVolume::UnregisterControlChangeNotify` or releases any `EndPointVolume` references.
-        let device = Rc::new(ArcSwap::from_pointee(unsafe {
-            DefaultAudioOutputDevice::acquire(&device_enumerator, Self::volume_callback, ())
-        }));
+        std::thread::spawn(move || Self::audio_thread(command_rx, watch_tx));
+
+        // SAFETY: We don't pass a pointer in `punkouter`, so it can't be invalid.
+        let device_enumerator: IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
+                .expect("all parameters should be valid");
+
+        let device = get_default_device(&device_enumerator);
+
+        let device_id = device
+            .as_ref()
+            .and_then(|d| unsafe { d.GetId() }.ok())
+            .and_then(|id| unsafe { id.to_hstring().ok() });
 
         let device_event_notif_client = MMNotificationClient {
-            device_changed_callback: Self::default_device_changed_callback,
-            arg: (Rc::clone(&device), Rc::clone(&device_enumerator)),
+            default_device_notifier: command_tx.clone(),
         }
         .into();
+
+        if let Some(device_id) = device_id {
+            command_tx
+                .send(AudioThreadCommand::NewDefault(device_id))
+                .unwrap();
+        }
 
         // SAFETY: `device_enumerator` and `device_event_notif_client` are valid references.
         unsafe {
@@ -81,95 +125,104 @@ impl DefaultAudioOutput {
         .expect("all parameters should be valid");
 
         Self {
-            device,
+            command_sender: command_tx,
             device_enumerator,
             device_event_notif_client,
+            volume_watch: watch_rx,
+        }
+    }
+
+    fn audio_thread(
+        commands: mpsc::Receiver<AudioThreadCommand>,
+        volume_watch: watch::Sender<Option<f32>>,
+    ) {
+        // SAFETY: We don't pass a pointer in `punkouter`, so it can't be invalid.
+        let device_enumerator: IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
+                .expect("all parameters should be valid");
+
+        let mut current_device = None;
+
+        for command in commands {
+            match command {
+                AudioThreadCommand::NewDefault(curr_device) => {
+                    current_device = unsafe {
+                        AudioOutputDevice::acquire(
+                            curr_device,
+                            &device_enumerator,
+                            Self::volume_callback,
+                            volume_watch.clone(),
+                        )
+                    };
+
+                    // SAFETY: `device.volume_interface` is a valid reference.
+                    let volume = current_device.as_ref().map(|device| {
+                        unsafe { device.volume_interface.GetMasterVolumeLevelScalar() }
+                            .expect("`volume_interface` should be valid")
+                    });
+
+                    if let Err(e) = volume_watch.send(volume) {
+                        eprintln!("failed to send updated volume: {e}");
+                    }
+                }
+                AudioThreadCommand::DeviceRemoved(removed_device) => {
+                    if current_device
+                        .as_ref()
+                        .is_some_and(|curr| curr.device_id == removed_device)
+                    {
+                        current_device = None;
+
+                        if let Err(e) = volume_watch.send(None) {
+                            eprintln!("failed to send unavailable volume: {e}");
+                        }
+                    }
+                }
+                AudioThreadCommand::SetVolume(volume) => {
+                    let volume = volume.clamp(0.0, MAX_NORMALIZED_VOLUME_LEVEL.min(1.0));
+
+                    let Some(device) = current_device.as_ref() else {
+                        return;
+                    };
+
+                    // Pass a zeroed GUID to the volume callback since we don't need to differentiate what caused the change.
+                    // SAFETY: `volume_interface` is a valid reference.
+                    unsafe {
+                        device
+                            .volume_interface
+                            .SetMasterVolumeLevelScalar(volume, &windows::core::GUID::zeroed())
+                    }
+                    .expect("volume should be in safe bounds");
+                }
+            }
         }
     }
 
     fn volume_callback(
         data: AUDIO_VOLUME_NOTIFICATION_DATA,
-        _arg: &(),
+        volume_watch: &watch::Sender<Option<f32>>,
     ) -> windows_core::Result<()> {
-        println!("volume changed: {:.0}", data.fMasterVolume * 100.0);
-        Ok(())
-    }
-
-    #[expect(
-        clippy::arc_with_non_send_sync,
-        reason = "ArcSwap requires Arc, even for objects that aren't Send + Sync"
-    )]
-    fn default_device_changed_callback(
-        flow: EDataFlow,
-        role: ERole,
-        device_id: PCWSTR,
-        (active_device, device_enumerator): &(
-            Rc<ArcSwap<Option<DefaultAudioOutputDevice>>>,
-            Rc<IMMDeviceEnumerator>,
-        ),
-    ) -> windows_core::Result<()> {
-        eprintln!("active device changed! {role:?} {flow:?} {device_id:?}");
-        if flow != eRender || role != eConsole {
-            return Ok(());
+        if let Err(e) = volume_watch.send(Some(data.fMasterVolume)) {
+            eprintln!("failed to send updated volume: {e}");
         }
 
-        /*
-        // eRender is output, eConsole is the default (and most common) role from what I can tell.
-        // SAFETY: `device_enumerator` is a valid reference.
-        let device = match unsafe { device_enumerator.GetDevice(device_id) } {
-            Ok(device) => device,
-            Err(e) if e.code() == ERROR_NOT_FOUND.to_hresult() => {
-                eprintln!("no output device with that ID ({device_id:?}) found: {e}");
-                return Ok(());
-            }
-            Err(e) => panic!("failed to retrieve audio output device: {e}"),
-        };
-        */
-
-        // SAFETY: The callback doesn't do any blocking operations, nor does it wait on synchronization,
-        // and it doesn't call `IAudioEndpointVolume::UnregisterControlChangeNotify` or releases any `EndPointVolume` references.
-        let device = unsafe {
-            DefaultAudioOutputDevice::acquire(device_enumerator, Self::volume_callback, ())
-        };
-
-        eprintln!("hi");
-        // Update the active device.
-        active_device.swap(Arc::new(device));
-        eprintln!("bye");
         Ok(())
     }
 
     pub fn get_master_volume(&self) -> Option<f32> {
-        let lock = self.device.load();
-        let device = lock.as_ref().as_ref()?;
-
-        // SAFETY: `volume_interface` is a valid reference.
-        Some(
-            unsafe { device.volume_interface.GetMasterVolumeLevelScalar() }
-                .expect("`volume_interface` should be valid"),
-        )
+        *self.volume_watch.borrow()
     }
 
-    fn set_master_volume(&self, volume: f32) {
-        let volume = volume.clamp(0.0, MAX_NORMALIZED_VOLUME_LEVEL.min(1.0));
-
-        let lock = self.device.load();
-        let Some(device) = lock.as_ref() else {
-            return;
-        };
-
-        // Pass a zeroed GUID to the volume callback since we don't need to differentiate what caused the change.
-        // SAFETY: `volume_interface` is a valid reference.
-        unsafe {
-            device
-                .volume_interface
-                .SetMasterVolumeLevelScalar(volume, &windows::core::GUID::zeroed())
+    pub fn set_master_volume(&self, volume: f32) {
+        if let Err(e) = self
+            .command_sender
+            .send(AudioThreadCommand::SetVolume(volume))
+        {
+            eprintln!("failed to send volume request ({volume}): {e}");
         }
-        .expect("volume should be in safe bounds");
     }
 }
 
-impl Drop for DefaultAudioOutput {
+impl Drop for AudioMonitor {
     fn drop(&mut self) {
         // SAFETY: `self.device_enumerator` is a valid reference and
         // `self.device_event_notif_client` is the same interface originally registered.
@@ -181,17 +234,19 @@ impl Drop for DefaultAudioOutput {
     }
 }
 
-struct DefaultAudioOutputDevice {
-    device: IMMDevice,
+#[derive(Debug)]
+struct AudioOutputDevice {
+    device_id: HSTRING,
     volume_interface: IAudioEndpointVolume,
     volume_callback_object: IAudioEndpointVolumeCallback,
 }
 
-impl DefaultAudioOutputDevice {
+impl AudioOutputDevice {
     // SAFETY: The methods in the callback must be non-blocking. The callback should never wait on a synchronization object.
-    // The callback should never call the `IAudioEndpointVolume::UnregisterControlChangeNotify`.
+    // The callback should never call `IAudioEndpointVolume::UnregisterControlChangeNotify`.
     // The callback should never release the final reference on an `EndpointVolume` API object.
     pub unsafe fn acquire<CallbackArg>(
+        device_id: HSTRING,
         device_enumerator: &IMMDeviceEnumerator,
         callback: VolumeCallbackFn<CallbackArg>,
         callback_arg: CallbackArg,
@@ -199,16 +254,7 @@ impl DefaultAudioOutputDevice {
     where
         CallbackArg: 'static,
     {
-        // `eRender` is output, `eConsole` is the default (and most common) role from what I can tell.
-        // SAFETY: `device_enumerator` is a valid reference.
-        let device = match unsafe { device_enumerator.GetDefaultAudioEndpoint(eRender, eConsole) } {
-            Ok(device) => device,
-            Err(e) if e.code() == ERROR_NOT_FOUND.to_hresult() => {
-                eprintln!("no output devices found");
-                return None;
-            }
-            Err(e) => panic!("failed to retrieve default audio output device: {e}"),
-        };
+        let device = get_device(device_enumerator, &device_id)?;
 
         // SAFETY: `device` is a valid reference, the generic is one of the allowed interfaces,
         // and we don't pass a pointer in `pactivationparams`, so it can't be invalid.
@@ -232,14 +278,14 @@ impl DefaultAudioOutputDevice {
         unsafe { volume_interface.RegisterControlChangeNotify(&volume_callback_object) }.unwrap();
 
         Some(Self {
-            device,
+            device_id,
             volume_interface,
             volume_callback_object,
         })
     }
 }
 
-impl Drop for DefaultAudioOutputDevice {
+impl Drop for AudioOutputDevice {
     fn drop(&mut self) {
         // SAFETY: `self.volume_interface` is a valid reference and
         // `self.volume_callback_object` is the same interface originally registered.
@@ -271,15 +317,11 @@ impl<CallbackArg> IAudioEndpointVolumeCallback_Impl
 }
 
 #[implement(IMMNotificationClient)]
-struct MMNotificationClient<CallbackArg>
-where
-    CallbackArg: 'static,
-{
-    device_changed_callback: DefaultDeviceChangedCallbackFn<CallbackArg>,
-    arg: CallbackArg,
+struct MMNotificationClient {
+    default_device_notifier: mpsc::Sender<AudioThreadCommand>,
 }
 
-impl<CallbackArg> IMMNotificationClient_Impl for MMNotificationClient_Impl<CallbackArg> {
+impl IMMNotificationClient_Impl for MMNotificationClient_Impl {
     fn OnDeviceStateChanged(
         &self,
         _pwstrdeviceid: &PCWSTR,
@@ -292,7 +334,23 @@ impl<CallbackArg> IMMNotificationClient_Impl for MMNotificationClient_Impl<Callb
         Ok(())
     }
 
-    fn OnDeviceRemoved(&self, _pwstrdeviceid: &PCWSTR) -> windows_core::Result<()> {
+    fn OnDeviceRemoved(&self, pwstrdeviceid: &PCWSTR) -> windows_core::Result<()> {
+        // SAFETY: `pwstrdeviceid` is guaranteed to be a valid, null-terminated pointer.
+        let removed_device = match unsafe { pwstrdeviceid.to_hstring() } {
+            Ok(new) => new,
+            Err(e) => {
+                eprintln!("failed to convert device ID (`{pwstrdeviceid:?}`) to `HSTRING`: {e}");
+                return Ok(());
+            }
+        };
+
+        if let Err(e) = self
+            .default_device_notifier
+            .send(AudioThreadCommand::DeviceRemoved(removed_device))
+        {
+            eprintln!("failed to send notification that device was removed: {e}");
+        }
+
         Ok(())
     }
 
@@ -302,7 +360,29 @@ impl<CallbackArg> IMMNotificationClient_Impl for MMNotificationClient_Impl<Callb
         role: ERole,
         pwstrdefaultdeviceid: &PCWSTR,
     ) -> windows_core::Result<()> {
-        (self.device_changed_callback)(flow, role, *pwstrdefaultdeviceid, &self.arg)
+        if flow != eRender || role != eConsole {
+            return Ok(());
+        }
+
+        // SAFETY: `pwstrdefaultdeviceid` is guaranteed to be a valid, null-terminated pointer.
+        let new_default = match unsafe { pwstrdefaultdeviceid.to_hstring() } {
+            Ok(new) => new,
+            Err(e) => {
+                eprintln!(
+                    "failed to convert device ID (`{pwstrdefaultdeviceid:?}`) to `HSTRING`: {e}"
+                );
+                return Ok(());
+            }
+        };
+
+        if let Err(e) = self
+            .default_device_notifier
+            .send(AudioThreadCommand::NewDefault(new_default))
+        {
+            eprintln!("failed to send notification that default device changed: {e}");
+        }
+
+        Ok(())
     }
 
     fn OnPropertyValueChanged(
@@ -317,7 +397,7 @@ impl<CallbackArg> IMMNotificationClient_Impl for MMNotificationClient_Impl<Callb
 fn main() {
     let _guard = initialize_com();
 
-    let audio_device = DefaultAudioOutput::new();
+    let audio_device = AudioMonitor::new();
 
     let current_volume = audio_device.get_master_volume().unwrap_or(0.0);
     println!("volume before: {:.0}", current_volume * 100.0);
