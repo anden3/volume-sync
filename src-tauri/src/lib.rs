@@ -3,6 +3,8 @@ use tokio::sync::oneshot;
 
 #[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+use windows::{AudioMonitor, AudioThreadCommand};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -12,15 +14,15 @@ pub fn run() {
     let (monitor_data_tx, monitor_data_rx) = oneshot::channel();
 
     std::thread::spawn(move || {
-        let monitor = windows::AudioMonitor::new();
-        let volume_events = monitor.volume_watch.clone();
-        let command_sender = monitor.command_sender.clone();
+        let monitor = AudioMonitor::new();
 
         monitor_data_tx
-            .send((volume_events, command_sender))
-            .unwrap();
+            .send((monitor.volume_watch.clone(), monitor.command_sender.clone()))
+            .expect("should be able to send monitor data back from thread");
 
-        finished_rx.blocking_recv().unwrap();
+        if let Err(e) = finished_rx.blocking_recv() {
+            eprintln!("tauri panicked, shutting down monitor thread: {e}");
+        }
     });
 
     let (mut volume_events, command_sender) = monitor_data_rx.blocking_recv().unwrap();
@@ -38,8 +40,7 @@ pub fn run() {
                     }
                 };
 
-                if let Err(e) = command_sender.send(windows::AudioThreadCommand::SetVolume(volume))
-                {
+                if let Err(e) = command_sender.send(AudioThreadCommand::SetVolume(volume)) {
                     eprintln!("failed to send volume request: {e}");
                 }
             });
@@ -73,5 +74,7 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 
-    finished_tx.send(()).unwrap();
+    finished_tx
+        .send(())
+        .expect("monitor thread should be alive");
 }

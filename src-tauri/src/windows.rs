@@ -82,6 +82,13 @@ fn get_default_device(device_enumerator: &IMMDeviceEnumerator) -> Option<IMMDevi
     }
 }
 
+fn get_device_id(device: &IMMDevice) -> HSTRING {
+    // SAFETY: `device` is a valid reference.
+    let id = unsafe { device.GetId() }.expect("should have enough memory");
+    // SAFETY: `id` contains a valid pointer.
+    unsafe { id.to_hstring() }.expect("should have enough memory")
+}
+
 #[derive(Debug)]
 pub struct AudioMonitor {
     pub volume_watch: watch::Receiver<Option<f32>>,
@@ -106,11 +113,7 @@ impl AudioMonitor {
                 .expect("all parameters should be valid");
 
         let device = get_default_device(&device_enumerator);
-
-        let device_id = device
-            .as_ref()
-            .and_then(|d| unsafe { d.GetId() }.ok())
-            .and_then(|id| unsafe { id.to_hstring().ok() });
+        let device_id = device.as_ref().map(get_device_id);
 
         let device_event_notif_client = MMNotificationClient {
             default_device_notifier: command_tx.clone(),
@@ -120,7 +123,7 @@ impl AudioMonitor {
         if let Some(device_id) = device_id {
             command_tx
                 .send(AudioThreadCommand::NewDefault(device_id))
-                .unwrap();
+                .expect("audio thread should be alive");
         }
 
         // SAFETY: `device_enumerator` and `device_event_notif_client` are valid references.
@@ -172,6 +175,7 @@ impl AudioMonitor {
                     }
                 }
                 AudioThreadCommand::DeviceRemoved(removed_device) => {
+                    // Unregister callbacks if the removed device is the one we're using.
                     if current_device
                         .as_ref()
                         .is_some_and(|curr| curr.device_id == removed_device)
@@ -184,6 +188,7 @@ impl AudioMonitor {
                     }
                 }
                 AudioThreadCommand::SetVolume(volume) => {
+                    // Don't accidentally blow up my ears when testing this.
                     let volume = volume.clamp(0.0, MAX_NORMALIZED_VOLUME_LEVEL.min(1.0));
 
                     let Some(device) = current_device.as_ref() else {
