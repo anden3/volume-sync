@@ -15,6 +15,10 @@ pub type VolumeCallbackFn<T> = fn(AUDIO_VOLUME_NOTIFICATION_DATA, &T) -> windows
 
 const MAX_NORMALIZED_VOLUME_LEVEL: f32 = 0.3;
 
+// We need to indicate that a volume change comes from us, so we can avoid sending it to the frontend.
+// The actual GUID here doesn't matter, I just generated one.
+const LOCAL_VOLUME_CHANGE_GUID: GUID = GUID::from_u128(0xdc1b615d_6d18_4f6e_af33_488e23d0dc6a);
+
 pub enum AudioThreadCommand {
     NewDefault(HSTRING),
     DeviceRemoved(HSTRING),
@@ -186,12 +190,11 @@ impl AudioMonitor {
                         return;
                     };
 
-                    // Pass a zeroed GUID to the volume callback since we don't need to differentiate what caused the change.
                     // SAFETY: `volume_interface` is a valid reference.
                     unsafe {
                         device
                             .volume_interface
-                            .SetMasterVolumeLevelScalar(volume, &windows::core::GUID::zeroed())
+                            .SetMasterVolumeLevelScalar(volume, &LOCAL_VOLUME_CHANGE_GUID)
                     }
                     .expect("volume should be in safe bounds");
                 }
@@ -203,6 +206,11 @@ impl AudioMonitor {
         data: AUDIO_VOLUME_NOTIFICATION_DATA,
         volume_watch: &watch::Sender<Option<f32>>,
     ) -> windows_core::Result<()> {
+        // Filter out volume changes we caused ourselves.
+        if data.guidEventContext == LOCAL_VOLUME_CHANGE_GUID {
+            return Ok(());
+        }
+
         if let Err(e) = volume_watch.send(Some(data.fMasterVolume)) {
             eprintln!("failed to send updated volume: {e}");
         }
