@@ -1,4 +1,4 @@
-use tauri::ipc::Channel;
+use tauri::{Emitter as _, Listener as _};
 use tokio::sync::oneshot;
 
 #[cfg(windows)]
@@ -26,13 +26,15 @@ pub fn run() {
     let (mut volume_events, command_sender) = monitor_data_rx.blocking_recv().unwrap();
 
     tauri::Builder::default()
-        .setup(|_app| {
-            let channel = Channel::new(move |msg| {
-                let volume: f32 = match msg.deserialize() {
+        .setup(|app| {
+            let handle = app.handle().clone();
+
+            app.listen("web-volume-changed", move |evt| {
+                let volume: f32 = match serde_json::from_str(evt.payload()) {
                     Ok(vol) => vol,
                     Err(e) => {
-                        eprintln!("failed to parse request from frontend");
-                        return Err(e.into());
+                        eprintln!("failed to parse request from frontend: {e}");
+                        return;
                     }
                 };
 
@@ -40,15 +42,24 @@ pub fn run() {
                 {
                     eprintln!("failed to send volume request: {e}");
                 }
-
-                Ok(())
             });
 
             tauri::async_runtime::spawn({
-                let channel = channel.clone();
                 async move {
-                    while let Ok(event) = volume_events.changed().await {
-                        if let Err(e) = channel.send(event) {
+                    // Send the initial volume (do-while would be nice here).
+                    if let Err(e) = handle.emit("system-volume-changed", *volume_events.borrow()) {
+                        eprintln!("failed to send volume event to frontend: {e}");
+                    }
+
+                    loop {
+                        if let Err(e) = volume_events.changed().await {
+                            eprintln!("failed to listen to system volume events: {e}");
+                            break;
+                        }
+
+                        if let Err(e) =
+                            handle.emit("system-volume-changed", *volume_events.borrow())
+                        {
                             eprintln!("failed to send volume event to frontend: {e}");
                         }
                     }
