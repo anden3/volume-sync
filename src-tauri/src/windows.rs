@@ -217,19 +217,6 @@ impl AudioMonitor {
 
         Ok(())
     }
-
-    pub fn get_master_volume(&self) -> Option<f32> {
-        *self.volume_watch.borrow()
-    }
-
-    pub fn set_master_volume(&self, volume: f32) {
-        if let Err(e) = self
-            .command_sender
-            .send(AudioThreadCommand::SetVolume(volume))
-        {
-            eprintln!("failed to send volume request ({volume}): {e}");
-        }
-    }
 }
 
 impl Drop for AudioMonitor {
